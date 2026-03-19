@@ -47,8 +47,8 @@ After the base system is installed and you've booted into it, clone this repo an
 ```bash
 git clone https://github.com/0xb0rn3/BLACKARCH_SETUP.git
 cd BLACKARCH_SETUP
-chmod +x fix-blackarch.sh
-sudo ./fix-blackarch.sh
+chmod +x fix-blackarch
+sudo ./fix-blackarch
 ```
 
 ### What the Script Does
@@ -79,10 +79,10 @@ Options:
   --no-color           Disable colored output
 
 Examples:
-  sudo ./fix-blackarch.sh                        # Full fix + upgrade
-  sudo ./fix-blackarch.sh -v                     # Verbose mode
-  sudo ./fix-blackarch.sh -s                     # Keyring fix only
-  sudo ./fix-blackarch.sh -m "https://my.mirror/archlinux/\$repo/os/\$arch"
+  sudo ./fix-blackarch                        # Full fix + upgrade
+  sudo ./fix-blackarch -v                     # Verbose mode
+  sudo ./fix-blackarch -s                     # Keyring fix only
+  sudo ./fix-blackarch -m "https://my.mirror/archlinux/\$repo/os/\$arch"
 ```
 
 Logs are written to `/var/log/blackarch-fix-<timestamp>.log`.
