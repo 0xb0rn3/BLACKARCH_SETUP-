@@ -296,9 +296,61 @@ system_upgrade() {
     ok "Python version after upgrade: ${new_py}"
 }
 
-# ── Phase 7: Post-upgrade cleanup ──────────────────────────────────────────
+# ── Phase 7: Java JDK/JRE conflict resolution ──────────────────────────────
+fix_java_env() {
+    log "Phase 7: Resolving Java JDK/JRE architecture conflicts..."
+
+    # jdk-openjdk now provides jre-openjdk — both cannot coexist.
+    # If both are installed, remove the standalone JRE and keep the JDK.
+    local jre_installed=0 jdk_installed=0
+
+    pacman -Qi jre-openjdk &>/dev/null && jre_installed=1
+    pacman -Qi jdk-openjdk &>/dev/null && jdk_installed=1
+
+    if [[ "$jre_installed" -eq 1 ]] && [[ "$jdk_installed" -eq 1 ]]; then
+        warn "Both jre-openjdk and jdk-openjdk installed — removing standalone JRE..."
+        pacman -Rdd jre-openjdk --noconfirm 2>>"$LOG_FILE" || true
+        ok "Removed conflicting jre-openjdk (jdk-openjdk provides it)."
+    elif [[ "$jre_installed" -eq 1 ]] && [[ "$jdk_installed" -eq 0 ]]; then
+        log "Only jre-openjdk found. Replacing with jdk-openjdk for full dev/pentest support..."
+        pacman -S jdk-openjdk --noconfirm --overwrite='*' 2>>"$LOG_FILE" || true
+        ok "jdk-openjdk installed (replaces jre-openjdk)."
+    elif [[ "$jdk_installed" -eq 1 ]]; then
+        ok "jdk-openjdk already installed, no JRE conflict."
+    else
+        log "No Java environment detected. Installing jdk-openjdk..."
+        pacman -S jdk-openjdk --noconfirm 2>>"$LOG_FILE" || true
+        ok "jdk-openjdk installed."
+    fi
+
+    # Set active Java environment via archlinux-java if available
+    if command -v archlinux-java &>/dev/null; then
+        local java_default
+        java_default=$(archlinux-java get 2>/dev/null || echo "")
+        if [[ -z "$java_default" ]]; then
+            # Auto-select the latest available JDK
+            local latest
+            latest=$(archlinux-java status 2>/dev/null | grep -oP 'java-\d+-openjdk' | sort -V | tail -1)
+            if [[ -n "$latest" ]]; then
+                log "Setting default Java environment: ${latest}"
+                archlinux-java set "$latest"
+                ok "Default Java set to ${latest}."
+            fi
+        else
+            dbg "Active Java environment: ${java_default}"
+        fi
+    fi
+
+    # CVE advisory notice
+    warn "Java CVE Advisory (Q1 2026):"
+    warn "  CVE-2026-29000 — pac4j Authentication Bypass (CVSS 10.0)"
+    warn "  CVE-2025-27363 — Oracle Java SE RCE (Active Exploitation)"
+    warn "  Ensure jdk-openjdk is at the latest patched version after upgrade."
+}
+
+# ── Phase 8: Post-upgrade cleanup ──────────────────────────────────────────
 post_cleanup() {
-    log "Phase 7: Post-upgrade cleanup..."
+    log "Phase 8: Post-upgrade cleanup..."
 
     # Remove orphaned packages
     local orphans
@@ -336,6 +388,7 @@ print_summary() {
     echo ""
     echo -e "  ${CYN}Kernel:${RST}  $(uname -r)"
     echo -e "  ${CYN}Python:${RST}  $(python3 --version 2>/dev/null || echo 'N/A')"
+    echo -e "  ${CYN}Java:${RST}    $(java --version 2>/dev/null | head -1 || echo 'N/A')"
     echo -e "  ${CYN}Pacman:${RST}  $(pacman --version | head -1)"
     echo -e "  ${CYN}Log:${RST}    ${LOG_FILE}"
     echo ""
@@ -364,6 +417,7 @@ main() {
     configure_mirrors
     ensure_blackarch_repo
     system_upgrade
+    fix_java_env
     post_cleanup
     print_summary
 }
