@@ -1,0 +1,371 @@
+#!/usr/bin/env bash
+# ============================================================================
+# fix-blackarch.sh — BlackArch Post-Calamares Recovery & Setup
+# Repository: github.com/0xb0rn3/BLACKARCH_SETUP
+# Author: 0xb0rn3 (q4n0)
+# License: MIT
+#
+# Usage:
+#   chmod +x fix-blackarch
+#   sudo ./fix-blackarch [OPTIONS]
+#
+# Options:
+#   -h, --help        Show this help message
+#   -v, --verbose     Enable verbose output
+#   -s, --skip-upgrade Skip the full system upgrade (keyring fix only)
+#   -m, --mirror URL  Use a custom Arch mirror URL
+#   --no-color        Disable colored output
+#
+# Description:
+#   Automates the full post-install recovery chain for BlackArch Linux
+#   after a Calamares installation from the 2023+ Slim ISO. Handles:
+#     1. Corrupted/stale PGP keyring wipe and rebuild
+#     2. Arch + BlackArch key population and trust signing
+#     3. Reflector bypass via manual mirror fallback
+#     4. Full system upgrade with Python version migration
+#     5. Orphan cleanup and optional AUR helper install
+# ============================================================================
+set -euo pipefail
+
+# ── Defaults ────────────────────────────────────────────────────────────────
+VERBOSE=0
+SKIP_UPGRADE=0
+NO_COLOR=0
+CUSTOM_MIRROR=""
+BLACKARCH_KEY="F9A6E68A711354D84A9B91637533BAFE69A25079"
+KEYSERVERS=(
+    "hkps://keyserver.ubuntu.com"
+    "hkps://keys.openpgp.org"
+    "hkps://pgp.mit.edu"
+)
+FALLBACK_MIRRORS=(
+    "https://mirrors.kernel.org/archlinux/\$repo/os/\$arch"
+    "https://geo.mirror.pkgbuild.com/\$repo/os/\$arch"
+    "https://mirror.rackspace.com/archlinux/\$repo/os/\$arch"
+)
+LOG_FILE="/var/log/blackarch-fix-$(date +%Y%m%d_%H%M%S).log"
+
+# ── Color Codes ─────────────────────────────────────────────────────────────
+setup_colors() {
+    if [[ "$NO_COLOR" -eq 1 ]] || [[ ! -t 1 ]]; then
+        RED="" GRN="" YEL="" BLU="" MAG="" CYN="" RST="" BLD=""
+    else
+        RED='\033[0;31m' GRN='\033[0;32m' YEL='\033[0;33m'
+        BLU='\033[0;34m' MAG='\033[0;35m' CYN='\033[0;36m'
+        RST='\033[0m'    BLD='\033[1m'
+    fi
+}
+
+# ── Logging ─────────────────────────────────────────────────────────────────
+log()  { echo -e "${BLU}[*]${RST} $*" | tee -a "$LOG_FILE"; }
+ok()   { echo -e "${GRN}[+]${RST} $*" | tee -a "$LOG_FILE"; }
+warn() { echo -e "${YEL}[!]${RST} $*" | tee -a "$LOG_FILE"; }
+err()  { echo -e "${RED}[-]${RST} $*" | tee -a "$LOG_FILE" >&2; }
+dbg()  { [[ "$VERBOSE" -eq 1 ]] && echo -e "${MAG}[D]${RST} $*" | tee -a "$LOG_FILE"; }
+
+banner() {
+    echo -e "${CYN}${BLD}"
+    cat << 'EOF'
+    ╔══════════════════════════════════════════════════╗
+    ║   ██████╗ ██╗      █████╗  ██████╗██╗  ██╗      ║
+    ║   ██╔══██╗██║     ██╔══██╗██╔════╝██║ ██╔╝      ║
+    ║   ██████╔╝██║     ███████║██║     █████╔╝       ║
+    ║   ██╔══██╗██║     ██╔══██║██║     ██╔═██╗       ║
+    ║   ██████╔╝███████╗██║  ██║╚██████╗██║  ██╗      ║
+    ║   ╚═════╝ ╚══════╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝      ║
+    ║           BLACKARCH POST-INSTALL FIX              ║
+    ║                  by 0xb0rn3                       ║
+    ╚══════════════════════════════════════════════════╝
+EOF
+    echo -e "${RST}"
+}
+
+# ── Argument Parsing ────────────────────────────────────────────────────────
+usage() {
+    cat << EOF
+Usage: sudo $(basename "$0") [OPTIONS]
+
+Options:
+  -h, --help           Show this help message and exit
+  -v, --verbose        Enable verbose/debug output
+  -s, --skip-upgrade   Fix keyring only, skip full -Syyu
+  -m, --mirror URL     Override default Arch mirror
+  --no-color           Disable colored output
+
+Examples:
+  sudo ./fix-blackarch
+  sudo ./fix-blackarch -v --skip-upgrade
+  sudo ./fix-blackarch -m "https://my.mirror.tld/archlinux/\\\$repo/os/\\\$arch"
+EOF
+    exit 0
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)       usage ;;
+            -v|--verbose)    VERBOSE=1; shift ;;
+            -s|--skip-upgrade) SKIP_UPGRADE=1; shift ;;
+            --no-color)      NO_COLOR=1; shift ;;
+            -m|--mirror)
+                [[ -z "${2:-}" ]] && { err "--mirror requires a URL argument"; exit 1; }
+                CUSTOM_MIRROR="$2"; shift 2 ;;
+            *)
+                err "Unknown option: $1"
+                usage ;;
+        esac
+    done
+}
+
+# ── Preflight Checks ───────────────────────────────────────────────────────
+preflight() {
+    if [[ $EUID -ne 0 ]]; then
+        err "This script must be run as root (use sudo)."
+        exit 1
+    fi
+
+    if ! command -v pacman &>/dev/null; then
+        err "pacman not found — this doesn't appear to be an Arch-based system."
+        exit 1
+    fi
+
+    # Check if we're on BlackArch or have BlackArch repos
+    if ! grep -q "\[blackarch\]" /etc/pacman.conf 2>/dev/null; then
+        warn "BlackArch repository not found in /etc/pacman.conf"
+        warn "Will attempt to add it after keyring setup."
+    fi
+
+    # Detect current Python version
+    local py_ver
+    py_ver=$(python3 --version 2>/dev/null | awk '{print $2}' || echo "not found")
+    log "Detected Python: ${py_ver}"
+    log "Target site-packages: $(python3 -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || echo 'unknown')"
+    log "Log file: ${LOG_FILE}"
+}
+
+# ── Phase 1: Kill stale GPG agents ─────────────────────────────────────────
+kill_gpg_agents() {
+    log "Phase 1: Terminating stale gpg-agent processes..."
+    killall gpg-agent 2>/dev/null || true
+    rm -rf /root/.gnupg/S.gpg-agent* 2>/dev/null || true
+    ok "GPG agents cleared."
+}
+
+# ── Phase 2: Nuke and rebuild keyring ───────────────────────────────────────
+rebuild_keyring() {
+    log "Phase 2: Wiping corrupted keyring and rebuilding..."
+
+    # Backup existing keyring dir (just in case)
+    if [[ -d /etc/pacman.d/gnupg ]]; then
+        dbg "Backing up old keyring to /etc/pacman.d/gnupg.bak.$(date +%s)"
+        cp -a /etc/pacman.d/gnupg "/etc/pacman.d/gnupg.bak.$(date +%s)" 2>/dev/null || true
+        rm -rf /etc/pacman.d/gnupg
+        ok "Old keyring removed."
+    fi
+
+    log "Initializing fresh pacman keyring..."
+    pacman-key --init
+    ok "Keyring initialized."
+
+    log "Populating Arch Linux keys..."
+    pacman-key --populate archlinux
+    ok "Arch keys populated."
+
+    # Attempt BlackArch key population if package is installed
+    if pacman -Qi blackarch-keyring &>/dev/null; then
+        log "Populating BlackArch keys (package found)..."
+        pacman-key --populate blackarch
+        ok "BlackArch keys populated from local keyring package."
+    else
+        dbg "blackarch-keyring package not installed, will inject key manually."
+    fi
+}
+
+# ── Phase 3: BlackArch developer key injection ──────────────────────────────
+inject_blackarch_key() {
+    log "Phase 3: Injecting BlackArch signing key..."
+
+    local key_imported=0
+    for ks in "${KEYSERVERS[@]}"; do
+        log "Trying keyserver: ${ks}"
+        if pacman-key --recv-keys "$BLACKARCH_KEY" --keyserver "$ks" 2>>"$LOG_FILE"; then
+            ok "Key received from ${ks}"
+            key_imported=1
+            break
+        else
+            warn "Failed on ${ks}, trying next..."
+        fi
+    done
+
+    if [[ "$key_imported" -eq 0 ]]; then
+        err "Could not retrieve BlackArch key from any keyserver."
+        err "Check your network connection and try again."
+        err "Manual fix: pacman-key --recv-keys ${BLACKARCH_KEY} --keyserver <your-keyserver>"
+        exit 1
+    fi
+
+    log "Locally signing BlackArch key..."
+    pacman-key --lsign-key "$BLACKARCH_KEY"
+    ok "BlackArch key signed and trusted."
+}
+
+# ── Phase 4: Mirror configuration ──────────────────────────────────────────
+configure_mirrors() {
+    log "Phase 4: Configuring Arch mirrors (Reflector bypass)..."
+
+    # Backup current mirrorlist
+    if [[ -f /etc/pacman.d/mirrorlist ]]; then
+        cp /etc/pacman.d/mirrorlist "/etc/pacman.d/mirrorlist.bak.$(date +%s)"
+        dbg "Original mirrorlist backed up."
+    fi
+
+    if [[ -n "$CUSTOM_MIRROR" ]]; then
+        log "Using custom mirror: ${CUSTOM_MIRROR}"
+        echo "Server = ${CUSTOM_MIRROR}" > /etc/pacman.d/mirrorlist
+    else
+        log "Writing fallback mirror list..."
+        : > /etc/pacman.d/mirrorlist
+        for mirror in "${FALLBACK_MIRRORS[@]}"; do
+            echo "Server = ${mirror}" >> /etc/pacman.d/mirrorlist
+        done
+    fi
+
+    ok "Mirrorlist updated ($(wc -l < /etc/pacman.d/mirrorlist) entries)."
+
+    # Disable Reflector service if it exists (it overwrites our mirrorlist)
+    if systemctl is-enabled reflector.service &>/dev/null; then
+        log "Disabling reflector.service to prevent mirrorlist overwrite..."
+        systemctl disable --now reflector.service 2>/dev/null || true
+        systemctl disable --now reflector.timer 2>/dev/null || true
+        ok "Reflector service disabled."
+    fi
+}
+
+# ── Phase 5: Ensure BlackArch repo is in pacman.conf ───────────────────────
+ensure_blackarch_repo() {
+    log "Phase 5: Verifying BlackArch repository in pacman.conf..."
+
+    if grep -q "\[blackarch\]" /etc/pacman.conf; then
+        ok "BlackArch repo already present in pacman.conf."
+        return
+    fi
+
+    warn "BlackArch repo missing — adding it now..."
+    cat >> /etc/pacman.conf << 'EOF'
+
+[blackarch]
+Include = /etc/pacman.d/blackarch-mirrorlist
+EOF
+
+    # Create blackarch mirrorlist if missing
+    if [[ ! -f /etc/pacman.d/blackarch-mirrorlist ]]; then
+        log "Creating BlackArch mirrorlist..."
+        cat > /etc/pacman.d/blackarch-mirrorlist << 'BAMIRROR'
+Server = https://blackarch.org/blackarch/$repo/os/$arch
+Server = https://ftp.halifax.rwth-aachen.de/blackarch/$repo/os/$arch
+Server = https://mirror.cyberbits.eu/blackarch/$repo/os/$arch
+BAMIRROR
+    fi
+
+    ok "BlackArch repository added to pacman.conf."
+}
+
+# ── Phase 6: Full system upgrade ───────────────────────────────────────────
+system_upgrade() {
+    if [[ "$SKIP_UPGRADE" -eq 1 ]]; then
+        warn "Phase 6: Skipping system upgrade (--skip-upgrade flag set)."
+        log "Run 'sudo pacman -Syyu' manually when ready."
+        return
+    fi
+
+    log "Phase 6: Forcing full system upgrade..."
+    log "This will migrate Python and all core packages to current versions."
+    log "Using --overwrite='*' to handle file conflicts from version jumps."
+
+    if ! pacman -Syyu --overwrite='*' --noconfirm 2>>"$LOG_FILE"; then
+        err "System upgrade encountered errors. Check ${LOG_FILE} for details."
+        warn "Common fix: run 'sudo pacman -Syyu --overwrite=\"*\"' manually to review conflicts."
+        return 1
+    fi
+
+    ok "System upgrade complete."
+
+    # Report new Python version
+    local new_py
+    new_py=$(python3 --version 2>/dev/null | awk '{print $2}' || echo "unknown")
+    ok "Python version after upgrade: ${new_py}"
+}
+
+# ── Phase 7: Post-upgrade cleanup ──────────────────────────────────────────
+post_cleanup() {
+    log "Phase 7: Post-upgrade cleanup..."
+
+    # Remove orphaned packages
+    local orphans
+    orphans=$(pacman -Qdtq 2>/dev/null || true)
+    if [[ -n "$orphans" ]]; then
+        log "Removing orphaned packages..."
+        echo "$orphans" | pacman -Rns --noconfirm - 2>>"$LOG_FILE" || true
+        ok "Orphans removed."
+    else
+        dbg "No orphaned packages found."
+    fi
+
+    # Clear package cache (keep last 2 versions)
+    if command -v paccache &>/dev/null; then
+        log "Trimming package cache..."
+        paccache -rk2 2>>"$LOG_FILE"
+        ok "Package cache trimmed."
+    fi
+
+    # Rebuild font cache
+    if command -v fc-cache &>/dev/null; then
+        dbg "Rebuilding font cache..."
+        fc-cache -fv &>/dev/null || true
+    fi
+
+    ok "Cleanup complete."
+}
+
+# ── Summary ─────────────────────────────────────────────────────────────────
+print_summary() {
+    echo ""
+    echo -e "${GRN}${BLD}═══════════════════════════════════════════════════${RST}"
+    echo -e "${GRN}${BLD}  BlackArch Post-Install Fix Complete${RST}"
+    echo -e "${GRN}${BLD}═══════════════════════════════════════════════════${RST}"
+    echo ""
+    echo -e "  ${CYN}Kernel:${RST}  $(uname -r)"
+    echo -e "  ${CYN}Python:${RST}  $(python3 --version 2>/dev/null || echo 'N/A')"
+    echo -e "  ${CYN}Pacman:${RST}  $(pacman --version | head -1)"
+    echo -e "  ${CYN}Log:${RST}    ${LOG_FILE}"
+    echo ""
+
+    if [[ "$SKIP_UPGRADE" -eq 1 ]]; then
+        warn "System upgrade was skipped. Run when ready:"
+        echo "    sudo pacman -Syyu --overwrite='*'"
+        echo ""
+    fi
+
+    log "Recommended: reboot now to load the updated kernel."
+    echo -e "    ${BLD}sudo reboot${RST}"
+    echo ""
+}
+
+# ── Main ────────────────────────────────────────────────────────────────────
+main() {
+    parse_args "$@"
+    setup_colors
+    banner
+    preflight
+
+    kill_gpg_agents
+    rebuild_keyring
+    inject_blackarch_key
+    configure_mirrors
+    ensure_blackarch_repo
+    system_upgrade
+    post_cleanup
+    print_summary
+}
+
+main "$@"
