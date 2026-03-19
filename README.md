@@ -47,8 +47,8 @@ After the base system is installed and you've booted into it, clone this repo an
 ```bash
 git clone https://github.com/0xb0rn3/BLACKARCH_SETUP.git
 cd BLACKARCH_SETUP
-chmod +x fix-blackarch
-sudo ./fix-blackarch
+chmod +x fix-blackarch.sh
+sudo ./fix-blackarch.sh
 ```
 
 ### What the Script Does
@@ -63,7 +63,8 @@ sudo ./fix-blackarch
 | 6 | Disable `reflector.service` and `reflector.timer` | Prevents Reflector from overwriting the fixed mirrorlist |
 | 7 | Verify `[blackarch]` repo block exists in `pacman.conf` | Adds it if missing, creates `blackarch-mirrorlist` |
 | 8 | `pacman -Syyu --overwrite='*'` | Full system upgrade; `--overwrite` handles file conflicts from major version jumps (e.g., Python 3.10 → 3.14) |
-| 9 | Remove orphaned packages, trim package cache | Cleanup |
+| 9 | Resolve JDK/JRE conflict, set default via `archlinux-java` | `jdk-openjdk` now provides `jre-openjdk`; both cannot coexist. Installs JDK if missing, removes standalone JRE if conflicting |
+| 10 | Remove orphaned packages, trim package cache | Cleanup |
 
 ### Script Options
 
@@ -78,10 +79,10 @@ Options:
   --no-color           Disable colored output
 
 Examples:
-  sudo ./fix-blackarch                        # Full fix + upgrade
-  sudo ./fix-blackarch -v                     # Verbose mode
-  sudo ./fix-blackarch -s                     # Keyring fix only
-  sudo ./fix-blackarch -m "https://my.mirror/archlinux/\$repo/os/\$arch"
+  sudo ./fix-blackarch.sh                        # Full fix + upgrade
+  sudo ./fix-blackarch.sh -v                     # Verbose mode
+  sudo ./fix-blackarch.sh -s                     # Keyring fix only
+  sudo ./fix-blackarch.sh -m "https://my.mirror/archlinux/\$repo/os/\$arch"
 ```
 
 Logs are written to `/var/log/blackarch-fix-<timestamp>.log`.
@@ -121,7 +122,20 @@ sudo pacman -Syyu --overwrite='*'
 
 The `--overwrite='*'` flag is required because the Python major version jump (3.10 → 3.14) causes file conflicts in `/usr/lib/python3.*/site-packages/`. Without it, pacman will refuse to proceed.
 
-### 5. Reboot
+### 5. Fix Java JDK/JRE Conflict
+
+```bash
+# Remove standalone JRE if JDK is also installed
+sudo pacman -Rdd jre-openjdk 2>/dev/null
+
+# Ensure JDK is installed (provides JRE)
+sudo pacman -S jdk-openjdk --needed
+
+# Set the active environment via archlinux-java (not manual JAVA_HOME exports)
+sudo archlinux-java set java-$(java --version 2>/dev/null | grep -oP '\d+' | head -1)-openjdk
+```
+
+### 6. Reboot
 
 ```bash
 sudo reboot
@@ -149,6 +163,31 @@ sudo pacman -S python-<package> --overwrite='*'
 grep "\[blackarch\]" /etc/pacman.conf
 ```
 
+**Java JDK/JRE conflict** — `jdk-openjdk` now provides `jre-openjdk`. If both are installed, pacman will error on upgrades. The script resolves this automatically. To fix manually:
+
+```bash
+# Remove standalone JRE (JDK provides it)
+sudo pacman -Rdd jre-openjdk
+
+# Install JDK if not present
+sudo pacman -S jdk-openjdk
+
+# Set default environment (never manually export JAVA_HOME with multiple versions)
+sudo archlinux-java set java-<version>-openjdk
+
+# Verify
+archlinux-java status
+```
+
+**Java CVE Advisory (Q1 2026)** — Two critical vulnerabilities affect Java environments:
+
+| CVE | Description | CVSS |
+|-----|-------------|------|
+| CVE-2026-29000 | pac4j Authentication Bypass | 10.0 |
+| CVE-2025-27363 | Oracle Java SE RCE (Active Exploitation) | High |
+
+Ensure your JDK is at the latest patched version after running the upgrade.
+
 ---
 
 ## Reference
@@ -165,4 +204,4 @@ MIT
 
 ## Author
 
-**0xb0rn3** — [github.com/0xb0rn3](https://github.com/0xb0rn3) · [q4n0@proton.me](mailto:oxbv1@proton.me)
+**0xb0rn3** — [github.com/0xb0rn3](https://github.com/0xb0rn3) · [oxbv1@proton.me](mailto:oxbv1@proton.me)
