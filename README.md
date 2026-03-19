@@ -165,4 +165,4 @@ MIT
 
 ## Author
 
-**0xb0rn3** — [github.com/0xb0rn3](https://github.com/0xb0rn3) · [q4n0@proton.me](mailto:q4n0@proton.me)
+**0xb0rn3** — [github.com/0xb0rn3](https://github.com/0xb0rn3) · [q4n0@proton.me](mailto:oxbv1@proton.me)
